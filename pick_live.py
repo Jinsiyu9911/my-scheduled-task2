@@ -107,7 +107,12 @@ def load_owners() -> tuple[set[str], dict[str, str]]:
     if OWNER_CSV.exists():
         o = pd.read_csv(OWNER_CSV, dtype={"code": str})
     elif OWNER_PARQUET.exists():
-        o = pd.read_parquet(OWNER_PARQUET)
+        try:
+            o = pd.read_parquet(OWNER_PARQUET)
+        except Exception as exc:            # pylint: disable=broad-except
+            raise FileNotFoundError(
+                f"读取 {OWNER_PARQUET} 失败（{type(exc).__name__}）："
+                f"请使用 {OWNER_CSV}，它不需要 pyarrow")
     else:
         raise FileNotFoundError(f"缺少股权名单：{OWNER_CSV} 或 {OWNER_PARQUET}")
     o["code"] = o["code"].astype(str).str.zfill(6)
@@ -285,7 +290,11 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     snap_cache = sorted(CACHE_DIR.glob("snap_*.parquet"))
     if offline and snap_cache:
-        snap = pd.read_parquet(snap_cache[-1])
+        try:
+            snap = pd.read_parquet(snap_cache[-1])
+        except Exception as exc:            # pylint: disable=broad-except
+            raise RuntimeError(
+                f"离线缓存读取失败（{type(exc).__name__}）：需要 pyarrow 才能用 --offline")
     else:
         snap = snapshot_tencent(universe, quiet=quiet)
         if snap.empty:
@@ -294,8 +303,14 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
         if snap.empty:
             raise RuntimeError("两个数据源都失败（东财/腾讯偶发 502 或限流），"
                                "等 30~60 秒重跑")
-        snap.to_parquet(CACHE_DIR / f"snap_{dt.date.today().isoformat()}.parquet",
-                        index=False)
+        try:
+            snap.to_parquet(
+                CACHE_DIR / f"snap_{dt.date.today().isoformat()}.parquet",
+                index=False)
+        except Exception as exc:            # pylint: disable=broad-except
+            # 缺 pyarrow/fastparquet 时 to_parquet 会抛 ImportError。
+            # 缓存只是调试便利，绝不能因此中断选股。
+            print(f"    [warn] 快照缓存写入跳过（{type(exc).__name__}），不影响选股")
 
     snap = snap[snap["code"].isin(soe) & snap["code"].map(is_main_board)]
     n_all = len(snap)
