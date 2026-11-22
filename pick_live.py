@@ -327,6 +327,8 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
 
     snap = snap.copy()
     snap["is_lu"] = (snap["price"] - snap["limit_up"]).abs() < 0.006
+    # 保留含涨停股在内的全量快照：模拟盘需要用它给「不在候选名单里的持仓」定价
+    snap_all = snap.copy()
     n_lu = int(snap["is_lu"].sum())
     snap = snap[~snap["is_lu"]]
 
@@ -360,6 +362,7 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
     return {
         "kept": kept,
         "dropped": dropped,
+        "snap": snap_all,
         "kind": kind,
         "stats": {
             "n_all": n_all, "n_valid": n_valid, "n_delisted": n_delisted,

@@ -125,16 +125,21 @@ def upsert_block(p: Path, rows: list[dict]) -> None:
 
 # --------------------------------------------------------------------------- 单个盘
 def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
-                  base: Path, fees: dict, log: list[str]) -> dict:
+                  base: Path, fees: dict, log: list[str],
+                  snap_all: pd.DataFrame | None = None) -> dict:
     d = base / pf
     d.mkdir(parents=True, exist_ok=True)
     st = load_json(d / "state.json",
                    {"cash": INIT_CAPITAL, "positions": {}, "initial": INIT_CAPITAL})
 
-    price = {r.code: float(r.price) for r in kept.itertuples()}
-    name = {r.code: str(r.name) for r in kept.itertuples()}
-    lu = {r.code: float(r.limit_up) for r in kept.itertuples()}
-    ld = {r.code: float(r.limit_down) for r in kept.itertuples()}
+    # 先用全量快照建价目表（覆盖所有持仓，含已跌出候选名单的），再用候选名单覆盖
+    price: dict[str, float] = {}
+    name: dict[str, str] = {}
+    if snap_all is not None and len(snap_all):
+        price = {str(c): float(p) for c, p in zip(snap_all["code"], snap_all["price"])}
+        name = {str(c): str(nm) for c, nm in zip(snap_all["code"], snap_all["name"])}
+    price.update({r.code: float(r.price) for r in kept.itertuples()})
+    name.update({r.code: str(r.name) for r in kept.itertuples()})
 
     # 目标：按市值升序取前 n 只「有有效报价」的（顺延机制）
     target, skipped = [], []
@@ -159,7 +164,7 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
     for c in sells:
         p = price.get(c)
         if not p or p <= 0:
-            log.append(f"  [{pf}] 卖出跳过 {c}（无报价）")
+            log.append(f"  [{pf}] 卖出跳过 {c}（无报价：停牌或已退市）")
             continue
         sh = int(pos[c]["shares"])
         amt = sh * p
@@ -333,7 +338,8 @@ def main() -> int:
         pf = f"n{pf_n}"
         log.append("")
         log.append(f"--- {pf} ---")
-        summary[pf] = run_portfolio(pf, pf_n, kept, run_date, base, fees, log)
+        summary[pf] = run_portfolio(pf, pf_n, kept, run_date, base, fees, log,
+                                    snap_all=res.get("snap"))
 
     sm["last_month"] = month_key
     sm["last_run"] = stamp
