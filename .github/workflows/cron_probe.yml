@@ -1,0 +1,14 @@
+name: cron-probe
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "event = ${{ github.event_name }}"
+          echo "cron  = ${{ github.event.schedule }}"
+          date -u
