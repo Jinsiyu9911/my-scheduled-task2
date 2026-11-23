@@ -1,31 +1,37 @@
 name: paper
 
-# ════════════════════════════════════════════════════════════════════════════
-#  所有可调参数都在这里，改完直接 push 即可生效
-# ════════════════════════════════════════════════════════════════════════════
-#  cron 用 UTC。北京时间 = UTC + 8，所以北京时间 14:50 = UTC 06:50。
+# ══════════════════════════════════════════════════════════════════════════════
+#  和现在线上的区别只有 2 处（跑的内容一字未改）：
 #
-#  ┌─ 正式跑：月末最后一个交易日 14:50 ──────────────────────────────┐
-#  │  '50 6 25-31 * *'  每月 25~31 日每天触发一次，                    │
-#  │                    脚本内部再判断「今天是不是本月最后一个工作日」， │
-#  │                    不是就跳过。                                    │
-#  └────────────────────────────────────────────────────────────────────┘
+#  A. 触发窗口从「25-31 号 + 每周一」≈ 19 次/年，改成「每天 2 次」= 730 次/年。
+#     GitHub 的 schedule 是 best-effort：**会延迟，也会整次丢弃**。
+#     实测同账号的 my-scheduled-task：cron '0 0 * * *' 的实际触发时间
+#        10-21 00:23 → 11-01 00:39 → 11-13 00:47 → 11-21 05:39 → 11-23 05:48
+#     （延迟从 20 分钟一路漂到 5 小时 48 分）；而 my-scheduled-task2 的
+#     '50 6 * * 1' 在 2026-11-23（周一）过了 6.5 小时仍然一条 schedule 记录都没有。
+#     —— 窗口越窄，丢一次就等于丢一整个月。改成每天触发，延迟几小时照样落在当天。
 #
-#  ┌─ 测试跑：每周一 14:50（测完把下面那行删掉）───────────────────┐
-#  │  '50 6 * * 1'      写 paper_test/，不影响正式记录                 │
-#  └────────────────────────────────────────────────────────────────────┘
+#  B. 「今天该不该记账」的判断从 YAML 的 cron 挪回脚本本身。
+#     paper_trade.py 里本来就有 is_month_end_trading_day() 和 last_month 幂等保护，
+#     所以多触发几次绝不会多记账：不是月末最后一个工作日就 [skip] 退出，
+#     同一个月已经记过账也会 [skip]。
+#     周日到周四触发基本是空跑（40 秒内退出），不浪费额度。
+#
+#  另外：兜底那一发（09:40 UTC）只补「正式跑」；周一的测试跑主尝试已经做过，
+#        不再重复，避免 paper_test 一天两跑。
+# ══════════════════════════════════════════════════════════════════════════════
 on:
   schedule:
-    - cron: '50 6 25-31 * *'
-    - cron: '50 6 * * 1'
+    - cron: '50 6 * * *'    # 主尝试：每天 14:50 北京时间
+    - cron: '40 9 * * *'    # 兜底：每天 17:40 北京时间（主尝试被丢弃时救场）
   workflow_dispatch:
     inputs:
       force:
-        description: 'ignore month-end check'
+        description: '忽略「是否月末最后工作日」检查'
         type: boolean
         default: true
       root:
-        description: 'paper_test or paper'
+        description: 'paper_test（测试）或 paper（正式）'
         type: choice
         options: [paper_test, paper]
         default: paper_test
@@ -39,15 +45,10 @@ concurrency:
 
 env:
   TZ: Asia/Shanghai
-  # ---- 组合只数（想只跑一个盘就写 "5"）----
   PORTFOLIOS: "5 10"
-  # ---- 候选池大小，必须 >= max(PORTFOLIOS) + 5 ----
   CAND: "20"
-  # ---- 初始资金（只在第一次运行、paper/ 还没生成时有效）----
   CAPITAL: "200000"
-  # ---- 涨停判定：回看多少个交易日 ----
   WINDOW: "20"
-  # ---- 涨停次数 >= CUT 就剔除 ----
   CUT: "2"
 
 jobs:
@@ -71,37 +72,59 @@ jobs:
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet -r requirements.txt
 
-      - name: args
-        id: args
+      - name: decide
+        id: d
         run: |
-          set -e
-          ROOT="paper"; FORCE=""
+          set -euo pipefail
+          TODAY=$(date +%F)     # TZ=Asia/Shanghai，按北京时间算日期
+          WD=$(date +%u)        # 1=周一 … 7=周日
+          ROOT=""
+          FLAGS=""
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ROOT="${{ inputs.root }}"
-            if [ "${{ inputs.force }}" = "true" ]; then FORCE="--force"; fi
-          elif [ "${{ github.event.schedule }}" = "50 6 * * 1" ]; then
-            ROOT="paper_test"; FORCE="--force"
+            if [ "${{ inputs.force }}" = "true" ]; then FLAGS="--force"; fi
+          else
+            # 本月最后一个工作日
+            LAST=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%F)
+            while [ "$(date -d "$LAST" +%u)" -ge 6 ]; do
+              LAST=$(date -d "$LAST -1 day" +%F)
+            done
+
+            if [ "$TODAY" = "$LAST" ]; then
+              ROOT="paper"                          # 正式跑；脚本内部还会再校验一次
+            elif [ "$WD" = "1" ]; then
+              ROOT="paper_test"                     # 周一测试跑
+              FLAGS="--force"
+            fi
+
+            # 兜底那一发只补正式跑，周测跑不重复
+            if [ "${{ github.event.schedule }}" = "40 9 * * *" ] && [ "$ROOT" = "paper_test" ]; then
+              ROOT=""
+            fi
           fi
-          echo "root=${ROOT}" >> "$GITHUB_OUTPUT"
-          echo "flags=${FORCE}" >> "$GITHUB_OUTPUT"
-          echo "target=${ROOT}  force=${FORCE:-no}"
+
+          echo "root=$ROOT"   >> "$GITHUB_OUTPUT"
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+          echo "今天 $TODAY（周$WD），目标目录='${ROOT:-无（跳过）}' 参数='${FLAGS:-无}'"
 
       - name: run
+        if: steps.d.outputs.root != ''
         run: |
           python -u paper_trade.py \
-            --root "${{ steps.args.outputs.root }}" \
+            --root "${{ steps.d.outputs.root }}" \
             --n ${{ env.PORTFOLIOS }} \
             --cand ${{ env.CAND }} \
             --capital ${{ env.CAPITAL }} \
             --window ${{ env.WINDOW }} \
             --cut ${{ env.CUT }} \
-            ${{ steps.args.outputs.flags }}
+            ${{ steps.d.outputs.flags }}
 
       - name: commit
-        if: success()
+        if: success() && steps.d.outputs.root != ''
         run: |
           set -e
-          ROOT="${{ steps.args.outputs.root }}"
+          ROOT="${{ steps.d.outputs.root }}"
           git config user.name  "paper-bot"
           git config user.email "paper-bot@users.noreply.github.com"
           if [ ! -d "$ROOT" ]; then
@@ -123,24 +146,28 @@ jobs:
       - name: summary
         if: always()
         run: |
-          ROOT="${{ steps.args.outputs.root }}"
+          ROOT="${{ steps.d.outputs.root }}"
           {
-            echo "### $ROOT  $(date '+%Y-%m-%d %H:%M %Z')"
+            echo "### 触发=${{ github.event_name }}  计划='${{ github.event.schedule }}'  目录='${ROOT:-无}'  $(date '+%Y-%m-%d %H:%M %Z')"
             echo ""
-            for PF in ${{ env.PORTFOLIOS }}; do
-              if [ -f "$ROOT/n$PF/equity.csv" ]; then
-                echo "**n=$PF**"
-                echo '```'
-                tail -n 5 "$ROOT/n$PF/equity.csv"
-                echo '```'
-              fi
-            done
+            if [ -z "$ROOT" ]; then
+              echo "今天不是记账日，本次为空跑（cron 只负责『叫醒』，跑不跑由脚本判断）。"
+            else
+              for PF in ${{ env.PORTFOLIOS }}; do
+                if [ -f "$ROOT/n$PF/equity.csv" ]; then
+                  echo "**$ROOT n=$PF**"
+                  echo '```'
+                  tail -n 5 "$ROOT/n$PF/equity.csv"
+                  echo '```'
+                fi
+              done
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: log-${{ github.run_number }}
-          path: ${{ steps.args.outputs.root }}/logs/*.log
+          path: ${{ steps.d.outputs.root }}/logs/*.log
           retention-days: 30
           if-no-files-found: ignore
