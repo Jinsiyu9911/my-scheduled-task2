@@ -1,92 +1,94 @@
-name: paper
+name: paper-chain
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  触发设计（2026-11 重构）
+#  常驻链（和 meter_monitor 的 main.yml + main.py 同一套架构）
 #
-#  ★ 准点原则：cron 只负责「把车打着」，不准时由 job 自己纠正。
-#    参考仓库 my-scheduled-task 能在整分准点采集，靠的不是 cron 准点，
-#    而是 main.py 里的 sleep_until_next_minute() —— 把执行时刻对齐到自己的时钟。
-#    这里照抄同一个思路：13:00 被唤醒 → 内部 sleep 到 14:50:00 → 才动手。
-#    于是无论 cron 准点、早到还是晚到一小时，真正记账的时刻都是 14:50:00。
+#  cron 是 best-effort：会晚几十分钟到几小时，也会整次丢弃，没有任何保证。
+#  所以真正的「准点」不能寄托在 cron 上，而是——
 #
-#  背景：GitHub 的 schedule 是 best-effort —— 会延迟，也会整次丢弃。
-#  同账号 my-scheduled-task 的 schedule 实测（cron = '0 0 * * *'，相对 00:00 UTC）：
-#      10-21  00:23  +23m       11-16  00:57  +57m
-#      11-17  00:46  +46m       11-19  00:54  +54m
-#      11-20  00:47  +47m       <- 常态是 23~57 分钟
-#      11-21  05:39  +5h39m     11-22  05:06  +5h06m     11-23  05:48  +5h48m
-#  早醒留的 110 分钟足够吃掉常态延迟；万一超出，wait 步骤会在开场时如实打印
-#  「被延迟了多少秒」，然后立刻运行 —— 不掩盖、不空等。
+#      只要有一个进程在 14:50 之前就已经活着，并且它自己数到了 14:50，
+#      准点就和 cron 无关了。
 #
-#  三层：
-#   A. 每天 13:00 唤醒，job 内部等到 14:50:00 准点跑（正式盘 + 测试盘）。
-#   B. 17:40 同日兜底 —— A 那一发被整次丢弃时救场。
-#   C. 次月 1~3 号 08:10（开盘前）再唤醒一次，这一发**不等待**（等到 14:50 就错过
-#      盘前窗口了）。此时行情的最新交易日还停在上月最后一天，脚本凭 data_date
-#      就能补记上个月的账，是真正与 A/B 独立的兜底。
-#  另外「今天该不该记账」不由 YAML 判断：YAML 只给窗口，
-#  真正的闸门在 paper_trade.py 里，用**行情自带的数据日**判断。
+#  ┌───────────────────────────────────────────────────────────────┐
+#  │  cron（兜底拉起，链断了靠它爬起）                              │
+#  └───────────────────────────┬───────────────────────────────────┘
+#                              ▼
+#  ┌───────────────────────────────────────────────────────────────┐
+#  │  runner_loop.py   跑 5h45m，每分钟看一次表                      │
+#  │    · 14:50 到点 → 子进程跑 paper_trade.py（正式盘 + 测试盘）    │
+#  │    · 09:00~09:29（每月 1~3 号）→ 盘前补跑正式盘                 │
+#  │    · 每次触发后 git commit + push                              │
+#  │    · 跑满 345 分钟 → exit(0) 主动交棒                          │
+#  └───────────────────────────┬───────────────────────────────────┘
+#                              ▼
+#  ┌───────────────────────────────────────────────────────────────┐
+#  │  Trigger Next Workflow：用 PAT 调 dispatch API 触发下一轮 ─────┼──┐
+#  └───────────────────────────────────────────────────────────────┘  │
+#                              ▲──────────────────────────────────────┘
 #
-#  两个数据目录，每次 schedule 触发都会动：
-#    paper       正式盘。只在每月 25 号 ~ 次月 3 号这 10 天进窗口，
-#                进去之后再靠脚本的 data_date 闸门筛出真正的月末最后一个交易日。
-#    paper_test  测试盘。每一次 schedule 触发都跑（--force --skip-if-ran-today），
-#                所以「调度器今天到底有没有叫醒我」每天都有实证可看。
-#                同一天只会真正调仓一次，后到的触发会被 skip 掉。
+#  为什么必须用 PAT：GitHub 规定「由 GITHUB_TOKEN 产生的 dispatch 不会再
+#  运行新 workflow」（防无限递归）。所以接力必须用 secrets.PAT_TOKEN。
 #
-#  正式盘排在测试盘之后跑：测试盘是金丝雀，它挂了（continue-on-error）
-#  绝不能连累正式盘；反之正式盘挂了整个 run 变红，测试盘的数据也就不提交。
+#  接力条件是 if: success()：Python 主动 exit(0) 才交棒。
+#  如果 Python 崩了（非 0 退出），**不交棒**——否则一个系统性 bug 会变成
+#  无限崩溃循环。这种情况由 cron 在 13:00 / 17:40 / 08:10 重新拉起。
+#
+#  数据目录（GITHUB_TOKEN 不允许写 .github/workflows/**，所以数据必须放仓库根）：
+#    paper/            正式盘
+#    paper_test/       测试盘
+#    chain_state.json  今天到底跑过没（跨 job 接力靠它去重）
 # ══════════════════════════════════════════════════════════════════════════════
 on:
   schedule:
-    # 早醒 → job 内部 sleep 到 14:50:00 再动手。这才是「准点」的来源：
-    # 参考仓库 my-scheduled-task 的 main.py 也是这么干的（sleep_until_next_minute），
-    # cron 只负责把车打着，准点由 job 自己的时钟对齐，跟触发早到晚到没关系。
-    - cron: '0 5 * * *'       # 13:00 北京时间 —— 提前 110 分钟醒来，等到 14:50:00
-    - cron: '40 9 * * *'      # 17:40 北京时间 —— 同日兜底（13:00 那发被整次丢弃时）
-    - cron: '10 0 1-3 * *'    # 08:10 北京时间，仅次月 1~3 号 —— 盘前补跑，不等待
+    # 兜底：链断了靠这三次把循环重新拉起来。13:00 那次最关键 ——
+    # 它在 14:50 前 110 分钟起跑，新拉起的循环有充足时间等到 14:50。
+    - cron: '0 5 * * *'       # 13:00 北京时间
+    - cron: '40 9 * * *'      # 17:40 北京时间（链断且已过 14:50 → 起来立刻补跑）
+    - cron: '10 0 1-3 * *'    # 08:10 北京时间，仅每月 1~3 号（盘前补跑兜底）
   workflow_dispatch:
     inputs:
-      force:
-        description: '忽略「是否月末最后交易日」和「本月已记账」检查'
+      max_run:
+        description: '本次循环秒数（测试用，留空=20700 即 5h45m）'
+        required: false
+        default: ''
+      run_now:
+        description: '立刻跑一次主触发，不等 14:50（手动补跑用）'
         type: boolean
-        default: true
-      root:
-        description: 'paper_test（测试）或 paper（正式）'
-        type: choice
-        options: [paper_test, paper]
-        default: paper_test
+        default: false
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
-  group: paper-trade
+  group: paper-chain
   cancel-in-progress: false
 
 env:
+  # runner 默认 UTC。不设成北京时间，14:50 会被当成 14:50 UTC，整天错 8 小时。
   TZ: Asia/Shanghai
   PORTFOLIOS: "5 10"
   CAND: "20"
   CAPITAL: "200000"
   WINDOW: "20"
   CUT: "2"
-  TARGET_HHMM: "14:50"      # 记账目标时刻（北京时间）
-  OPEN_HHMM: "09:30"        # 开盘时刻；在此之前被唤醒=盘前补跑，必须立刻跑不能等
 
 jobs:
-  run:
+  run-loop:
     runs-on: ubuntu-latest
-    # 最长要 13:00 起床 + 等待 110 分钟 + 跑 2 分钟，给到 140 分钟
-    timeout-minutes: 140
+    # 平台单 job 硬上限 6 小时。runner_loop.py 在 5h45m 主动 exit(0) 交棒，
+    # 这里的 timeout 只是防止 Python 卡死时被平台强杀。
+    timeout-minutes: 350
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout（保留完整历史，便于 rebase 推送）
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
@@ -96,120 +98,29 @@ jobs:
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet -r requirements.txt
 
-      # ── 准点闸门 ────────────────────────────────────────────────────────
-      # 参考仓库的「准点」不来自 cron，而来自 job 内部把自己的时钟对齐到目标时刻
-      # （main.py 的 sleep_until_next_minute）。这里同理：13:00 被唤醒，
-      # sleep 到 14:50:00 才开始跑 —— 于是无论 cron 是准点、早到还是晚到一小时，
-      # 真正动手的时刻都是 14:50:00。
-      # 唯一例外：开盘前（09:30 之前）被唤醒，那是次月 1~3 号的盘前补跑窗口，
-      # 必须立刻跑，等下去就错过开盘了。
-      - name: wait until target
-        if: github.event_name == 'schedule'
+      - name: Run runner_loop.py
+        env:
+          MAX_RUN: ${{ github.event.inputs.max_run }}
+          RUN_NOW: ${{ github.event.inputs.run_now }}
+          # 推送用 PAT：仓库若把 Workflow 权限设成只读，GITHUB_TOKEN 推不上去，
+          # 而 YAML 里的 permissions 只能降权不能提权。只传进环境变量，不打印。
+          GH_PUSH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          set -euo pipefail
-          TS=Asia/Shanghai
-          now() { TZ=$TS date '+%F %H:%M:%S'; }
-
-          # 时区必须真的生效，否则「14:50」会被当成 14:50 UTC = 22:50 北京，
-          # 白白多等 8 小时（本机 Git-bash 没有 tzdata 就会这样）。硬校验一次。
-          OFF=$(TZ=$TS date +%z)
-          if [ "$OFF" != "+0800" ]; then
-            echo "::error::TZ=$TS 未生效（date +%z = $OFF），目标时刻会算错 8 小时"
-            exit 1
-          fi
-
-          TARGET="$(TZ=$TS date +%F) ${TARGET_HHMM}:00"
-          OPEN="$(TZ=$TS date +%F) ${OPEN_HHMM}:00"
-          NOW=$(date +%s)
-          T=$(TZ=$TS date -d "$TARGET" +%s)
-          O=$(TZ=$TS date -d "$OPEN" +%s)
-          WAIT=$((T - NOW))
-          echo "现在 $(now)（UTC$OFF）| 目标 $TARGET | 还差 ${WAIT}s"
-
-          # 盘前补跑必须第一个判：08:10 被唤醒时 WAIT 是 400 分钟，
-          # 若先过下面那道「窗口上限」就会被判成异常而中止，补跑永远跑不成。
-          if [ "$NOW" -lt "$O" ]; then
-            echo "开盘前 —— 盘前补跑窗口，立刻运行（不等待）"
-            exit 0
-          fi
-
-          # 早醒窗口最长 110 分钟。若算出更久，说明时区或 cron 出了别的问题，
-          # 宁可红着报出来，也不要闷头睡 8 小时。
-          if [ "$WAIT" -gt 9000 ]; then
-            echo "::error::距目标还有 $((WAIT / 60)) 分钟，远超早醒窗口，中止"
-            exit 1
-          fi
-
-          if [ "$WAIT" -gt 0 ]; then
-            echo "等到 ${TARGET}（睡 ${WAIT} 秒）"
-            sleep "$WAIT"
-            echo "现在 $(now)，准点开始"
+          ARGS=""
+          if [ -n "${MAX_RUN}" ]; then ARGS="--max-run ${MAX_RUN}"; fi
+          if [ "${RUN_NOW}" = "true" ]; then ARGS="${ARGS} --run-now"; fi
+          echo "启动参数: ${ARGS:-（默认 5h45m，14:50 主触发）}"
+          if [ -n "${GH_PUSH_TOKEN}" ]; then
+            echo "推送凭证: secrets.PAT_TOKEN"
           else
-            echo "已过目标 $((-WAIT)) 秒（cron 被延迟），立刻运行"
+            echo "::warning::没有 PAT_TOKEN，推送退回到 GITHUB_TOKEN（可能只读）"
           fi
+          python -u runner_loop.py ${ARGS}
 
-      - name: decide
-        id: d
-        run: |
-          set -euo pipefail
-          TODAY=$(date +%F)          # TZ=Asia/Shanghai，按北京时间算日期
-          WD=$(date +%u)             # 1=周一 … 7=周日
-          D=$((10#$(date +%d)))      # 10# 强制十进制，免得 08/09 被当八进制
-          ROOT=""
-          FLAGS=""
-          TEST=""
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # 手动触发：只跑你指定的那一个目录，不额外跑测试盘
-            ROOT="${{ inputs.root }}"
-            if [ "${{ inputs.force }}" = "true" ]; then FLAGS="--force"; fi
-          else
-            # 正式盘：只在月末窗口内交给脚本判定。
-            # 这里刻意**不再**用 shell 算「本月最后一个工作日」：
-            #   1) 一旦和脚本的交易日历口径不一致，就会静默丢月，且没有任何报错；
-            #   2) 日历日判定无法覆盖「月末延迟跨午夜」的补跑。
-            if [ "$D" -ge 25 ] || [ "$D" -le 3 ]; then
-              ROOT="paper"
-            fi
-            # 测试盘：每一次 schedule 触发都跑，保证每天都有调度器的心跳实证。
-            # --skip-if-ran-today 会让同一天的后续触发（17:40 / 08:10）秒退。
-            TEST="paper_test"
-          fi
-
-          echo "root=$ROOT"   >> "$GITHUB_OUTPUT"
-          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
-          echo "test=$TEST"   >> "$GITHUB_OUTPUT"
-          echo "今天 $TODAY（周$WD）正式='${ROOT:-无}' 测试='${TEST:-无}'"
-
-      # 金丝雀：先跑测试盘。挂了只标警告，不影响后面的正式盘。
-      - name: run paper_test
-        if: steps.d.outputs.test != ''
-        continue-on-error: true
-        run: |
-          python -u paper_trade.py \
-            --root "${{ steps.d.outputs.test }}" \
-            --n ${{ env.PORTFOLIOS }} \
-            --cand ${{ env.CAND }} \
-            --capital ${{ env.CAPITAL }} \
-            --window ${{ env.WINDOW }} \
-            --cut ${{ env.CUT }} \
-            --force --skip-if-ran-today
-
-      # 正式盘：失败就是真失败，整条 run 变红。
-      - name: run paper
-        if: steps.d.outputs.root != ''
-        run: |
-          python -u paper_trade.py \
-            --root "${{ steps.d.outputs.root }}" \
-            --n ${{ env.PORTFOLIOS }} \
-            --cand ${{ env.CAND }} \
-            --capital ${{ env.CAPITAL }} \
-            --window ${{ env.WINDOW }} \
-            --cut ${{ env.CUT }} \
-            ${{ steps.d.outputs.flags }}
-
-      - name: commit
-        if: success() && (steps.d.outputs.root != '' || steps.d.outputs.test != '')
+      - name: Commit data（兜底提交）
+        # runner_loop.py 每次触发后都会自己提交；这里补上它没管的（以及收尾瞬间的状态），
+        # 确保本轮结束前一定落盘一次。
+        if: success()
         run: |
           set -euo pipefail
           git config user.name  "paper-bot"
@@ -220,8 +131,9 @@ jobs:
           for R in paper paper_test; do
             if [ -d "$R" ]; then DIRS="${DIRS:+$DIRS,}$R"; PATHS="$PATHS $R"; fi
           done
-          if [ -z "$DIRS" ]; then
-            echo "::notice::没有任何数据目录（脚本判定今天不记账），无需提交"
+          if [ -f chain_state.json ]; then PATHS="$PATHS chain_state.json"; fi
+          if [ -z "$PATHS" ]; then
+            echo "::notice::没有可提交的数据目录"
             exit 0
           fi
 
@@ -231,52 +143,84 @@ jobs:
             echo "无改动"
             exit 0
           fi
-          git commit -m "paper: ${DIRS} $(date '+%Y-%m-%d %H:%M')"
+          git commit -m "paper: 收尾提交 ${DIRS} $(date '+%Y-%m-%d %H:%M')"
 
-          # 以前这里三次失败也只打一条 warning，循环最后一条命令是 sleep（成功），
-          # 于是 step 退出码 0 —— 运行显示绿色，但数据根本没进仓库。
           PUSHED=0
           for i in 1 2 3; do
-            # pull 失败不该挡住 push：分支刚建出来时远端还没有这个 ref，
-            # pull 会报 "couldn't find remote ref"，但 push 是完全可行的。
+            # pull 失败不该挡住 push：分支刚建出来时远端还没有这个 ref。
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
               || echo "::warning::pull 失败，直接尝试 push"
-            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              PUSHED=1
-              break
-            fi
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then PUSHED=1; break; fi
             echo "::warning::第 $i 次 push 失败，3 秒后重试"
             sleep 3
           done
           if [ "$PUSHED" != "1" ]; then
-            echo "::error::push 失败：本次记账只存在于 runner 上，没有进仓库"
+            echo "::error::推送失败：本轮数据只存在于 runner 上"
             exit 1
           fi
 
-      - name: summary
+      - name: Trigger Next Workflow (Restart)
+        # 只有前面都成功（Python 主动 exit(0)）才交棒。
+        # Python 崩了就不交棒，交给 cron 在 13:00 / 17:40 / 08:10 重新拉起 ——
+        # 否则一个系统性 bug 会变成无限崩溃循环。
+        if: success()
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [ -z "${PAT_TOKEN}" ]; then
+            echo "::error::缺少 secrets.PAT_TOKEN，接力失败（PAT 需要 actions:write + contents:write）"
+            echo "::warning::接力链已断，只能等 cron 在 13:00 / 17:40 / 08:10 重新拉起"
+            exit 1
+          fi
+          echo "上一轮已正常结束，正在触发下一轮……"
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PAT_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/paper_trade.yml/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ github.run_number }}
+          path: |
+            paper/logs/*.log
+            paper_test/logs/*.log
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Summary
         if: always()
         run: |
           set -uo pipefail
           D=$((10#$(date +%d)))
 
           # 健康检查：每月 5 号之后，如果上个月的账还没记，就报警。
-          # 这是「整个月被悄悄跳过」的唯一外部可见信号。
           WARN=""
           if [ -f paper/state.json ]; then
             LM=$(python -c "import json;print(json.load(open('paper/state.json')).get('last_month') or '')" || true)
             PREV=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m)
-            # last_month 比上月还旧 = 至少有一个月没记账（ISO 月份串可以直接按字典序比）
             if [[ "${LM:-0000-00}" < "$PREV" ]] && [ "$D" -ge 5 ]; then
               WARN="上月 $PREV 没有记账记录（last_month=${LM:-空}）"
             fi
           fi
 
           {
-            echo "### 触发=${{ github.event_name }}  计划='${{ github.event.schedule }}'  正式='${{ steps.d.outputs.root }}'  测试='${{ steps.d.outputs.test }}'  $(date '+%Y-%m-%d %H:%M %Z')"
+            echo "### paper-chain 本轮摘要"
             echo ""
+            echo "- 现在：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "- 触发：${{ github.event_name }}（计划='${{ github.event.schedule }}'）"
+            if [ -f chain_state.json ]; then
+              echo "- 链路状态："
+              echo '```json'
+              cat chain_state.json
+              echo '```'
+            fi
             for R in paper paper_test; do
               for PF in ${{ env.PORTFOLIOS }}; do
                 if [ -f "$R/n$PF/equity.csv" ]; then
+                  echo ""
                   echo "**$R n=$PF**"
                   echo '```'
                   tail -n 3 "$R/n$PF/equity.csv"
@@ -290,16 +234,4 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -n "$WARN" ]; then
-            echo "::warning::$WARN"
-          fi
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: log-${{ github.run_number }}
-          path: |
-            paper/logs/*.log
-            paper_test/logs/*.log
-          retention-days: 30
-          if-no-files-found: ignore
+          if [ -n "$WARN" ]; then echo "::warning::$WARN"; fi
