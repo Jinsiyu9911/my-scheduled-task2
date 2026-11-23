@@ -80,12 +80,39 @@ def last_weekday_of_month(d: dt.date) -> dt.date:
 
 
 def is_month_end_trading_day(d: dt.date) -> bool:
-    """粗判：今天是否本月最后一个交易日。
+    """粗判：d 是否它所在月份的最后一个交易日。
 
-    只做「今天 = 本月最后一个工作日」的判断；若该日恰逢节假日，需要 --force 手动跑，
-    或者由下一交易日的前一次运行补上（脚本有幂等保护，同一个月不会记两次）。
+    只做「本月最后一个工作日」的判断，不查节假日。真正的闸门在 main() 里
+    用**行情自带的数据日**去调它，所以「月末那次被延迟到次月 1~3 号盘前」的运行
+    依然能算出 data_date = 上月最后交易日，从而把上个月的账补上。
     """
     return d.weekday() < 5 and d == last_weekday_of_month(d)
+
+
+# 月末窗口：每月 25 号 ~ 次月 3 号。
+#   本月最后一个交易日最早可能落在 26 号（2 月 28 日是周日时），25 号开窗留一天余量；
+#   次月 1~3 号盘前行情还停在上月最后交易日，属于合法的补跑窗口。
+# 窗口只决定「值不值得去拉行情」，真正的判定由 data_date 决定。
+WINDOW_TAIL_DAYS = 25
+WINDOW_HEAD_DAYS = 3
+
+
+def in_month_end_window(d: dt.date) -> bool:
+    return d.day >= WINDOW_TAIL_DAYS or d.day <= WINDOW_HEAD_DAYS
+
+
+def prev_nav(p: Path, date: str, default: float) -> float:
+    """读 date 之前最后一条净值记录；没有历史时退化为初始资金。"""
+    if not p.exists():
+        return default
+    try:
+        df = pd.read_csv(p, encoding="utf-8-sig")
+        df = df[df["date"].astype(str) < str(date)]
+        if len(df):
+            return float(df["nav"].iloc[-1])
+    except Exception:                      # noqa: BLE001
+        pass
+    return default
 
 
 # --------------------------------------------------------------------------- 工具
@@ -103,23 +130,22 @@ def save_json(p: Path, obj: dict) -> None:
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def append_csv(p: Path, row: dict) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame([row])
-    header = not p.exists()
-    df.to_csv(p, mode="a", header=header, index=False, encoding="utf-8-sig")
-
-
 def upsert_block(p: Path, rows: list[dict]) -> None:
-    """按日期整块 upsert：同一天重复运行（测试）时整块覆盖，不产生重复行。"""
+    """按日期整块 upsert：同一天重复运行（测试/补跑）时整块覆盖，不产生重复行。
+
+    holdings / equity / trades 三个文件都走这里，保证「同一天最多一份记录」。
+    列不一致时取并集（旧文件缺新列时补空，反之亦然），避免 schema 演进时 KeyError。
+    """
     if not rows:
-        return
+        return                                 # 空块不动文件：同日复跑无成交＝维持原记录
     p.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows).astype(str)
     if p.exists():
         old = pd.read_csv(p, dtype=str)
         old = old[old["date"] != str(rows[0]["date"])]
-        df = pd.concat([old[df.columns], df], ignore_index=True)
+        cols = list(dict.fromkeys([*old.columns, *df.columns]))
+        df = pd.concat([old.reindex(columns=cols), df.reindex(columns=cols)],
+                       ignore_index=True)
     df.to_csv(p, index=False, encoding="utf-8-sig")
 
 
@@ -154,10 +180,16 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
 
     pos = {c: dict(v) for c, v in st["positions"].items()}
     cash = float(st["cash"])
-    nav_before = cash + sum(pos[c]["shares"] * price.get(c, pos[c]["cost"]) for c in pos)
+    # 上一期净值用于算「本期收益率」。绝不能像以前那样用「当日价重估 → 当日价重估」
+    # 的差，那样相减之后只剩手续费，收益率永远是 0。
+    nav_prev = prev_nav(d / "equity.csv", date, float(st.get("initial", INIT_CAPITAL)))
 
     sells = [c for c in pos if c not in target]
     buys_pre = [c for c in target if c not in pos]
+
+    # 成交先攒在内存，跑完统一按日期整块写盘：
+    # 中途异常退出不会留下半截成交，同日复跑也不会产生重复行。
+    trades: list[dict] = []
 
     # --- 卖出 ---
     n_trades = 0
@@ -170,7 +202,7 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
         amt = sh * p
         comm, stamp, tran, fee = calc_fee(amt, "SELL", fees)
         cash += amt - fee
-        append_csv(d / "trades.csv", {
+        trades.append({
             "date": date, "portfolio": pf, "code": c, "name": name.get(c, pos[c].get("name", "")),
             "side": "SELL", "price": round(p, 3), "shares": sh, "amount": round(amt, 2),
             "commission": comm, "stamp_duty": stamp, "transfer_fee": tran,
@@ -194,16 +226,17 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
                 continue
             amt = sh * p
             comm, stamp, tran, fee = calc_fee(amt, "BUY", fees)
-            if amt + fee > cash:
+            # 以前只减一手就完事，减完不复查；现金极薄时仍可能透支成负现金。
+            while sh >= LOT and amt + fee > cash:
                 sh -= LOT
-                if sh < LOT:
-                    log.append(f"  [{pf}] 买入跳过 {c}（现金不足）")
-                    continue
                 amt = sh * p
                 comm, stamp, tran, fee = calc_fee(amt, "BUY", fees)
+            if sh < LOT:
+                log.append(f"  [{pf}] 买入跳过 {c}（现金不足）")
+                continue
             cash -= amt + fee
             pos[c] = {"shares": sh, "cost": round(p, 3), "name": name.get(c, "")}
-            append_csv(d / "trades.csv", {
+            trades.append({
                 "date": date, "portfolio": pf, "code": c, "name": name.get(c, ""),
                 "side": "BUY", "price": round(p, 3), "shares": sh, "amount": round(amt, 2),
                 "commission": comm, "stamp_duty": stamp, "transfer_fee": tran,
@@ -213,35 +246,63 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
             n_trades += 1
 
     # --- 快照 ---
-    mv = sum(pos[c]["shares"] * price.get(c, pos[c]["cost"]) for c in pos)
-    nav = cash + mv
-    hrows = []
+    # 关键：拿不到报价的持仓以前会被静默按 cost 估值，holdings.csv 里就出现
+    # last_price == cost_price 的「平盘」假象，看上去和当天刚买入的行一模一样。
+    # 现在多打一列 price_src 把这件事显式化，并在日志里点名。
+    mv = 0.0
+    ghosts = []
+    marked: list[tuple[str, float, str]] = []
     for c in sorted(pos):
-        p = price.get(c, pos[c]["cost"])
+        p = price.get(c)
+        if p is None or not (float(p) > 0):
+            p, src = float(pos[c]["cost"]), "cost"      # 兜底估值，不是真实市值
+            ghosts.append(c)
+        else:
+            p, src = float(p), "market"
+        mv += pos[c]["shares"] * p
+        marked.append((c, p, src))
+    nav = cash + mv
+
+    hrows = []
+    for c, p, src in marked:
+        cost = float(pos[c]["cost"])
+        v = pos[c]["shares"] * p
         hrows.append({
             "date": date, "portfolio": pf, "code": c,
             "name": name.get(c, pos[c].get("name", "")),
-            "shares": int(pos[c]["shares"]), "cost_price": pos[c]["cost"],
-            "last_price": round(float(p), 3),
-            "market_value": round(pos[c]["shares"] * float(p), 2),
-            "weight": round(pos[c]["shares"] * float(p) / nav, 4) if nav else 0.0,
+            "shares": int(pos[c]["shares"]), "cost_price": cost,
+            "last_price": round(p, 3),
+            "market_value": round(v, 2),
+            # weight 的分母是 NAV（含现金），所以各只相加会略小于 1，差额就是现金
+            "weight": round(v / nav, 4) if nav else 0.0,
+            "pnl_pct": round((p / cost - 1) * 100, 3) if cost else 0.0,
+            "price_src": src,
         })
+    if ghosts:
+        log.append(f"  [{pf}] ! {len(ghosts)} 只无报价，按成本估值（市值不可信）："
+                   + "  ".join(f"{c}@{pos[c]['cost']}" for c in ghosts))
     upsert_block(d / "holdings.csv", hrows)
+    fee_paid = sum(t["fee_total"] for t in trades)
+    ret_pct = round((nav / nav_prev - 1) * 100, 3) if nav_prev else 0.0
     upsert_block(d / "equity.csv", [{
         "date": date, "cash": round(cash, 2), "market_value": round(mv, 2),
         "nav": round(nav, 2), "nav_index": round(nav / st["initial"], 6),
         "positions": len(pos), "trades": n_trades,
-        "ret_pct": round((nav / nav_before - 1) * 100, 3) if nav_before else 0.0,
+        "ret_pct": ret_pct,
+        "fee_pct": round(fee_paid / nav * 100, 3) if nav else 0.0,
     }])
+    upsert_block(d / "trades.csv", trades)
 
     st["cash"] = cash
     st["positions"] = pos
     save_json(d / "state.json", st)
 
     log.append(f"  [{pf}] NAV {nav:,.2f}（指数 {nav/st['initial']:.4f}） "
-               f"现金 {cash:,.0f} 持仓 {len(pos)} 只 成交 {n_trades} 笔")
+               f"本期 {ret_pct:+.2f}%  现金 {cash:,.0f} 持仓 {len(pos)} 只 "
+               f"成交 {n_trades} 笔 费用 {fee_paid:.2f}")
     return {"nav": nav, "nav_index": nav / st["initial"], "positions": len(pos),
-            "trades": n_trades, "skipped": skipped}
+            "trades": n_trades, "skipped": skipped, "ret_pct": ret_pct,
+            "ghosts": ghosts}
 
 
 # --------------------------------------------------------------------------- 主流程
@@ -252,41 +313,45 @@ def main() -> int:
     ap.add_argument("--cand", type=int, default=20, help="候选数（顺延备用）")
     ap.add_argument("--capital", type=float, default=INIT_CAPITAL)
     ap.add_argument("--date", default="", help="覆盖记账日期 YYYY-MM-DD（测试用）")
-    ap.add_argument("--force", action="store_true", help="忽略「是否月末最后交易日」检查")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略「是否月末最后交易日」和「本月已记账」两道检查")
+    ap.add_argument("--skip-if-ran-today", action="store_true",
+                    help="今天已经跑过就退出（给每周测试跑用，避免同日重复调仓）")
     ap.add_argument("--window", type=int, default=20)
     ap.add_argument("--cut", type=int, default=2)
     ap.add_argument("--dry-run", action="store_true", help="只选股，不写模拟盘")
     args = ap.parse_args()
 
     base = ROOT / args.root
-    base.mkdir(parents=True, exist_ok=True)
-    cfg_p = base / "config.json"
-    cfg = load_json(cfg_p, {})
-    if not cfg:
-        cfg = {"fees": FEES, "initial_capital": args.capital,
-               "portfolios": args.n, "created": dt.date.today().isoformat()}
-        save_json(cfg_p, cfg)
-        for pf in args.n:
-            save_json(base / f"n{pf}" / "state.json",
-                      {"cash": args.capital, "positions": {}, "initial": args.capital})
-    fees = {**FEES, **cfg.get("fees", {})}
-
     today = dt.date.today()
     run_date = args.date or today.isoformat()
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     head = [f"模拟盘运行 {stamp}", f"记账日期 {run_date}"]
-
-    # --- 日期闸门 ---
-    if not args.force and not args.date:
-        if not is_month_end_trading_day(today):
-            print(f"[skip] {today} 不是本月最后一个工作日，退出（用 --force 可强制运行）")
-            return 0
     sm = load_json(base / "state.json", {})
-    month_key = run_date[:7]
-    # --force 同时绕过「本月已记账」的幂等保护，方便反复测试
-    if sm.get("last_month") == month_key and not args.dry_run and not args.force:
-        print(f"[skip] {month_key} 已记账（上次 {sm.get('last_run')}），退出")
+
+    # ── 闸门顺序很重要 ────────────────────────────────────────────────
+    # 1) 同日复跑保护：每周测试跑 + 手动重跑同一天时不要二次调仓
+    if args.skip_if_ran_today and not args.date:
+        if str(sm.get("last_run", ""))[:10] == today.isoformat():
+            print(f"[skip] 今天已跑过（上次 {sm.get('last_run')}），跳过重复测试跑")
+            return 0
+
+    # 2) 廉价闸门：只有落在「可能的月末」窗口内才值得去拉一遍全市场行情
+    if not args.force and not args.date and not in_month_end_window(today):
+        print(f"[skip] {today} 不在月末窗口（每月 {WINDOW_TAIL_DAYS} 号 ~ 次月 "
+              f"{WINDOW_HEAD_DAYS} 号），退出")
         return 0
+
+    # 2b) 窗口内的廉价幂等预判：判据只有「本月已记账」和「次月头几天且上月已记账」。
+    #     这条捷径只用来省掉一次全市场行情拉取，绝不会挡住该记的账——
+    #     真正的闸门仍是下面拿到 data_date 之后的那一道。
+    if not args.force and not args.date and not args.dry_run:
+        cur_key = today.strftime("%Y-%m")
+        prev_key = (today.replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m")
+        done = sm.get("last_month")
+        if done == cur_key or (today.day <= WINDOW_HEAD_DAYS and done == prev_key):
+            print(f"[skip] {done} 已记账（上次 {sm.get('last_run')}），本月无需再跑")
+            return 0
 
     print(f"  候选池 {args.cand} 只，组合 " + "/".join(f"n={x}" for x in args.n))
 
@@ -296,11 +361,14 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"  [X] 选股失败：{exc}")
         return 2
-    kept, st = res["kept"], res["stats"]
+    kept, stt = res["kept"], res["stats"]
     if len(kept) < max(args.n):
         print(f"  [X] 可用候选只有 {len(kept)} 只，少于 max(n)={max(args.n)}")
         return 2
-    data_date = st["data_date"] or run_date
+    # data_date 可能是 str / date / Timestamp（取决于行情源给的 index 类型），
+    # 统一成 'YYYY-MM-DD' 字符串，后面所有比较和记账都按这个口径走。
+    data_date = stt["data_date"]
+    data_date = str(data_date)[:10] if data_date else run_date
     # 非交易时段/休市运行时，行情是上一个交易日的收盘价。
     # 记账日期必须跟着数据日走，否则净值序列会多出一条无效行（例如周六）。
     if not args.date and data_date != run_date:
@@ -314,9 +382,51 @@ def main() -> int:
             print(f"  [!] 数据日已过期 {gap} 天，确认行情源是否正常")
         run_date = data_date
         head[1] = f"记账日期 {run_date}"
-    head.append(f"数据日 {data_date} | 快照有效 {st['n_valid']} | 剔退市 {st['n_delisted']}"
-                f" | 剔涨停 {st['n_limitup']} | 剔近{args.window}日涨停>={args.cut} "
-                f"{st['n_dropped_rule']}")
+
+    # 3) 正式闸门：用**行情自带的交易日**判断，而不是日历日。
+    #    这样月末那次被延迟到次月 1~3 号盘前的运行，data_date 仍停在上月最后
+    #    交易日，判定为真 -> 把上个月的账补上；而次月 1~3 号盘后运行时
+    #    data_date 已是新月份 -> 判定为假 -> 正常跳过。
+    if not args.force and not args.date:
+        try:
+            gate_day = dt.date.fromisoformat(run_date)
+        except ValueError:
+            gate_day = today
+        if not is_month_end_trading_day(gate_day):
+            print(f"[skip] 数据日 {run_date} 不是它所在月份的最后一个交易日，退出"
+                  f"（用 --force 可强制运行）")
+            return 0
+
+    # 4) 幂等键必须用**定稿后**的 run_date。以前在 data_date 校正之前就取，
+    #    跨月补跑会把 last_month 写成下个月，于是下个月的正式跑被自己的幂等挡死。
+    month_key = run_date[:7]
+    if sm.get("last_month") == month_key and not args.dry_run and not args.force:
+        print(f"[skip] {month_key} 已记账（上次 {sm.get('last_run')}），退出")
+        return 0
+
+    head.append(f"数据日 {data_date} | 快照有效 {stt['n_valid']} | 剔退市/停牌 "
+                f"{stt['n_delisted']} | 剔涨停 {stt['n_limitup']} | "
+                f"剔近{args.window}日涨停>={args.cut} {stt['n_dropped_rule']}")
+
+    if args.dry_run:
+        pk = kept.head(args.cand).copy()
+        pk["mktcap_亿"] = (pk["mktcap"] / 1e8).round(2)
+        print(pk[["rank", "code", "name", "price", "mktcap_亿", "nlu"]]
+              .head(max(args.n)).to_string(index=False))
+        return 0
+
+    # --- 到这里才真的可能落盘：先建目录、初始化 config/state ---
+    base.mkdir(parents=True, exist_ok=True)
+    cfg_p = base / "config.json"
+    cfg = load_json(cfg_p, {})
+    if not cfg:
+        cfg = {"fees": FEES, "initial_capital": args.capital,
+               "portfolios": args.n, "created": today.isoformat()}
+        save_json(cfg_p, cfg)
+        for pf in args.n:
+            save_json(base / f"n{pf}" / "state.json",
+                      {"cash": args.capital, "positions": {}, "initial": args.capital})
+    fees = {**FEES, **cfg.get("fees", {})}
 
     # --- 落盘候选 ---
     (base / "picks").mkdir(exist_ok=True)
@@ -325,11 +435,6 @@ def main() -> int:
     pk["owner"] = pk["code"].map(res["kind"])
     pk.drop(columns=["mktcap", "is_lu"], errors="ignore").to_csv(
         base / "picks" / f"{run_date}.csv", index=False, encoding="utf-8-sig")
-
-    if args.dry_run:
-        print(pk[["rank", "code", "name", "price", "mktcap_亿", "nlu"]]
-              .head(max(args.n)).to_string(index=False))
-        return 0
 
     # --- 跑各盘 ---
     log = list(head)
@@ -349,7 +454,7 @@ def main() -> int:
     log.append("")
     for pf, v in summary.items():
         log.append(f"  {pf}: NAV {v['nav']:,.2f}  指数 {v['nav_index']:.4f}  "
-                   f"持仓 {v['positions']}")
+                   f"持仓 {v['positions']}  本期 {v['ret_pct']:+.2f}%")
     (base / "logs").mkdir(exist_ok=True)
     (base / "logs" / f"{run_date}.log").write_text("\n".join(log), encoding="utf-8")
     print("\n".join(log))

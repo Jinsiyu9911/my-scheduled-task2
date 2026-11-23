@@ -320,12 +320,22 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
     n_valid = len(snap)
 
     name_s = snap["name"].fillna("").astype(str)
-    dead = (snap["limit_up"].isna() | (snap["limit_up"] <= 0)
-            | name_s.str.contains("退"))
+    no_limit = snap["limit_up"].isna() | (snap["limit_up"] <= 0)
+    n_nolimit = int(no_limit.sum())            # 拿不到涨停价：多半是停牌/退市整理
+    dead = no_limit | name_s.str.contains("退")
     snap = snap[~dead]
     n_delisted = n_valid - len(snap)
 
     snap = snap.copy()
+    # 腾讯给的涨停/跌停价对 ST 一律按 10% 报，但主板 ST 的真实限幅是 5%。
+    # 本策略的持仓几乎全是 ST，不修正会有两个后果：
+    #   1) ST 封在 +5%（真实买不到）不会被 is_lu 判掉，被当成可买；
+    #   2) picks.csv 的「挂涨停价买入」挂到 +10%，ST 到 +5% 就封死，永远不成交。
+    # 判定口径与 count_limit_up() 的 5%/10% 双判保持一致。
+    is_st = name_s[~dead].str.contains("ST")
+    if is_st.any():
+        snap.loc[is_st, "limit_up"] = (snap.loc[is_st, "prev_close"] * 1.05 + 1e-9).round(2)
+        snap.loc[is_st, "limit_down"] = (snap.loc[is_st, "prev_close"] * 0.95 + 1e-9).round(2)
     snap["is_lu"] = (snap["price"] - snap["limit_up"]).abs() < 0.006
     # 保留含涨停股在内的全量快照：模拟盘需要用它给「不在候选名单里的持仓」定价
     snap_all = snap.copy()
@@ -366,6 +376,7 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
         "kind": kind,
         "stats": {
             "n_all": n_all, "n_valid": n_valid, "n_delisted": n_delisted,
+            "n_nolimit": n_nolimit,
             "n_limitup": n_lu, "n_dropped_rule": len(dropped),
             "data_date": data_date, "universe": len(universe),
             "bars_short": int((cand_df["bars"] < int(window * 0.8)).sum()),
@@ -401,8 +412,9 @@ def main() -> int:
     kept, dropped = res["kept"], res["dropped"]
     print(f"  央国企主板代码：{st['universe']} 只")
     print(f"  快照有效：{st['n_valid']} 只（原始 {st['n_all']}）")
-    print(f"  剔除退市/退市整理期：{st['n_delisted']} 只")
-    print(f"  剔除当日涨停：{st['n_limitup']} 只（买不到）")
+    print(f"  剔除退市/退市整理期/无报价：{st['n_delisted']} 只"
+          f"（其中 {st['n_nolimit']} 只拿不到涨停价，多为停牌）")
+    print(f"  剔除当日涨停：{st['n_limitup']} 只（买不到；ST 按 5% 判定，不是行情源的 10%）")
     print(f"  按总市值升序取前 {len(kept) + len(dropped)} 只算涨停次数")
     print(f"  剔除近{args.window}日涨停 >= {args.cut} 次：{st['n_dropped_rule']} 只")
     if st["n_dropped_rule"]:

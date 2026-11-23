@@ -1,33 +1,38 @@
 name: paper
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  和现在线上的区别只有 2 处（跑的内容一字未改）：
+#  触发设计（2026-11 重构）
 #
-#  A. 触发窗口从「25-31 号 + 每周一」≈ 19 次/年，改成「每天 2 次」= 730 次/年。
-#     GitHub 的 schedule 是 best-effort：**会延迟，也会整次丢弃**。
-#     实测同账号的 my-scheduled-task：cron '0 0 * * *' 的实际触发时间
-#        10-21 00:23 → 11-01 00:39 → 11-13 00:47 → 11-21 05:39 → 11-23 05:48
-#     （延迟从 20 分钟一路漂到 5 小时 48 分）；而 my-scheduled-task2 的
-#     '50 6 * * 1' 在 2026-11-23（周一）过了 6.5 小时仍然一条 schedule 记录都没有。
-#     —— 窗口越窄，丢一次就等于丢一整个月。改成每天触发，延迟几小时照样落在当天。
+#  背景：GitHub 的 schedule 是 best-effort —— 会延迟，也会整次丢弃。
+#  同账号的 my-scheduled-task 实测延迟：20 分钟 / 39 分钟 / 47 分钟 / 5h39m / 5h48m。
+#  月度任务窗口太窄，丢一次就丢一整个月，所以做了三层：
 #
-#  B. 「今天该不该记账」的判断从 YAML 的 cron 挪回脚本本身。
-#     paper_trade.py 里本来就有 is_month_end_trading_day() 和 last_month 幂等保护，
-#     所以多触发几次绝不会多记账：不是月末最后一个工作日就 [skip] 退出，
-#     同一个月已经记过账也会 [skip]。
-#     周日到周四触发基本是空跑（40 秒内退出），不浪费额度。
+#   A. 每天 14:50 / 17:40 各唤醒一次（同一发被丢弃还有第二发）。
+#   B. 次月 1~3 号 08:10（开盘前）再唤醒一次 —— 这一发才是真正的独立兜底：
+#      A 那两发在同一个调度队列里，延迟是高度相关的；B 换了一天，且卡在开盘前，
+#      此时行情的最新交易日还停在上月最后一天，脚本能凭 data_date 补记上个月的账。
+#   C. 「今天该不该记账」不再由 YAML 判断。YAML 只负责给窗口，
+#      真正的闸门在 paper_trade.py 里，用**行情自带的数据日**判断。
 #
-#  另外：兜底那一发（09:40 UTC）只补「正式跑」；周一的测试跑主尝试已经做过，
-#        不再重复，避免 paper_test 一天两跑。
+#  两个数据目录，每次 schedule 触发都会动：
+#    paper       正式盘。只在每月 25 号 ~ 次月 3 号这 10 天进窗口，
+#                进去之后再靠脚本的 data_date 闸门筛出真正的月末最后一个交易日。
+#    paper_test  测试盘。每一次 schedule 触发都跑（--force --skip-if-ran-today），
+#                所以「调度器今天到底有没有叫醒我」每天都有实证可看。
+#                同一天只会真正调仓一次，17:40 那一发会被 skip 掉。
+#
+#  正式盘排在测试盘之后跑：测试盘是金丝雀，它挂了（continue-on-error）
+#  绝不能连累正式盘；反之正式盘挂了整个 run 变红，测试盘的数据也就不提交。
 # ══════════════════════════════════════════════════════════════════════════════
 on:
   schedule:
-    - cron: '50 6 * * *'    # 主尝试：每天 14:50 北京时间
-    - cron: '40 9 * * *'    # 兜底：每天 17:40 北京时间（主尝试被丢弃时救场）
+    - cron: '50 6 * * *'      # 14:50 北京时间 —— 主尝试（正式盘 + 测试盘）
+    - cron: '40 9 * * *'      # 17:40 北京时间 —— 同日兜底（主尝试被丢弃时救场）
+    - cron: '10 0 1-3 * *'    # 08:10 北京时间，仅次月 1~3 号 —— 盘前补跑窗口
   workflow_dispatch:
     inputs:
       force:
-        description: '忽略「是否月末最后工作日」检查'
+        description: '忽略「是否月末最后交易日」和「本月已记账」检查'
         type: boolean
         default: true
       root:
@@ -76,39 +81,51 @@ jobs:
         id: d
         run: |
           set -euo pipefail
-          TODAY=$(date +%F)     # TZ=Asia/Shanghai，按北京时间算日期
-          WD=$(date +%u)        # 1=周一 … 7=周日
+          TODAY=$(date +%F)          # TZ=Asia/Shanghai，按北京时间算日期
+          WD=$(date +%u)             # 1=周一 … 7=周日
+          D=$((10#$(date +%d)))      # 10# 强制十进制，免得 08/09 被当八进制
           ROOT=""
           FLAGS=""
+          TEST=""
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # 手动触发：只跑你指定的那一个目录，不额外跑测试盘
             ROOT="${{ inputs.root }}"
             if [ "${{ inputs.force }}" = "true" ]; then FLAGS="--force"; fi
           else
-            # 本月最后一个工作日
-            LAST=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%F)
-            while [ "$(date -d "$LAST" +%u)" -ge 6 ]; do
-              LAST=$(date -d "$LAST -1 day" +%F)
-            done
-
-            if [ "$TODAY" = "$LAST" ]; then
-              ROOT="paper"                          # 正式跑；脚本内部还会再校验一次
-            elif [ "$WD" = "1" ]; then
-              ROOT="paper_test"                     # 周一测试跑
-              FLAGS="--force"
+            # 正式盘：只在月末窗口内交给脚本判定。
+            # 这里刻意**不再**用 shell 算「本月最后一个工作日」：
+            #   1) 一旦和脚本的交易日历口径不一致，就会静默丢月，且没有任何报错；
+            #   2) 日历日判定无法覆盖「月末延迟跨午夜」的补跑。
+            if [ "$D" -ge 25 ] || [ "$D" -le 3 ]; then
+              ROOT="paper"
             fi
-
-            # 兜底那一发只补正式跑，周测跑不重复
-            if [ "${{ github.event.schedule }}" = "40 9 * * *" ] && [ "$ROOT" = "paper_test" ]; then
-              ROOT=""
-            fi
+            # 测试盘：每一次 schedule 触发都跑，保证每天都有调度器的心跳实证。
+            # --skip-if-ran-today 会让同一天的后续触发（17:40 / 08:10）秒退。
+            TEST="paper_test"
           fi
 
           echo "root=$ROOT"   >> "$GITHUB_OUTPUT"
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
-          echo "今天 $TODAY（周$WD），目标目录='${ROOT:-无（跳过）}' 参数='${FLAGS:-无}'"
+          echo "test=$TEST"   >> "$GITHUB_OUTPUT"
+          echo "今天 $TODAY（周$WD）正式='${ROOT:-无}' 测试='${TEST:-无}'"
 
-      - name: run
+      # 金丝雀：先跑测试盘。挂了只标警告，不影响后面的正式盘。
+      - name: run paper_test
+        if: steps.d.outputs.test != ''
+        continue-on-error: true
+        run: |
+          python -u paper_trade.py \
+            --root "${{ steps.d.outputs.test }}" \
+            --n ${{ env.PORTFOLIOS }} \
+            --cand ${{ env.CAND }} \
+            --capital ${{ env.CAPITAL }} \
+            --window ${{ env.WINDOW }} \
+            --cut ${{ env.CUT }} \
+            --force --skip-if-ran-today
+
+      # 正式盘：失败就是真失败，整条 run 变红。
+      - name: run paper
         if: steps.d.outputs.root != ''
         run: |
           python -u paper_trade.py \
@@ -121,53 +138,97 @@ jobs:
             ${{ steps.d.outputs.flags }}
 
       - name: commit
-        if: success() && steps.d.outputs.root != ''
+        if: success() && (steps.d.outputs.root != '' || steps.d.outputs.test != '')
         run: |
-          set -e
-          ROOT="${{ steps.d.outputs.root }}"
+          set -euo pipefail
           git config user.name  "paper-bot"
           git config user.email "paper-bot@users.noreply.github.com"
-          if [ ! -d "$ROOT" ]; then
-            echo "::warning::$ROOT not created (skipped by date gate)"
+
+          DIRS=""
+          PATHS=""
+          for R in paper paper_test; do
+            if [ -d "$R" ]; then DIRS="${DIRS:+$DIRS,}$R"; PATHS="$PATHS $R"; fi
+          done
+          if [ -z "$DIRS" ]; then
+            echo "::notice::没有任何数据目录（脚本判定今天不记账），无需提交"
             exit 0
           fi
-          git add -A -- "$ROOT"
+
+          # shellcheck disable=SC2086  # 这里就是要按空格拆
+          git add -A -- $PATHS
           if git diff --cached --quiet; then
-            echo "no change"
-          else
-            git commit -m "paper(${ROOT}): $(date '+%Y-%m-%d %H:%M')"
-            for i in 1 2 3; do
-              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && \
-              git push origin "HEAD:${GITHUB_REF_NAME}" && break
-              echo "::warning::push retry $i"; sleep 3
-            done
+            echo "无改动"
+            exit 0
+          fi
+          git commit -m "paper: ${DIRS} $(date '+%Y-%m-%d %H:%M')"
+
+          # 以前这里三次失败也只打一条 warning，循环最后一条命令是 sleep（成功），
+          # 于是 step 退出码 0 —— 运行显示绿色，但数据根本没进仓库。
+          PUSHED=0
+          for i in 1 2 3; do
+            # pull 失败不该挡住 push：分支刚建出来时远端还没有这个 ref，
+            # pull 会报 "couldn't find remote ref"，但 push 是完全可行的。
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
+              || echo "::warning::pull 失败，直接尝试 push"
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              PUSHED=1
+              break
+            fi
+            echo "::warning::第 $i 次 push 失败，3 秒后重试"
+            sleep 3
+          done
+          if [ "$PUSHED" != "1" ]; then
+            echo "::error::push 失败：本次记账只存在于 runner 上，没有进仓库"
+            exit 1
           fi
 
       - name: summary
         if: always()
         run: |
-          ROOT="${{ steps.d.outputs.root }}"
+          set -uo pipefail
+          D=$((10#$(date +%d)))
+
+          # 健康检查：每月 5 号之后，如果上个月的账还没记，就报警。
+          # 这是「整个月被悄悄跳过」的唯一外部可见信号。
+          WARN=""
+          if [ -f paper/state.json ]; then
+            LM=$(python -c "import json;print(json.load(open('paper/state.json')).get('last_month') or '')" || true)
+            PREV=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m)
+            # last_month 比上月还旧 = 至少有一个月没记账（ISO 月份串可以直接按字典序比）
+            if [[ "${LM:-0000-00}" < "$PREV" ]] && [ "$D" -ge 5 ]; then
+              WARN="上月 $PREV 没有记账记录（last_month=${LM:-空}）"
+            fi
+          fi
+
           {
-            echo "### 触发=${{ github.event_name }}  计划='${{ github.event.schedule }}'  目录='${ROOT:-无}'  $(date '+%Y-%m-%d %H:%M %Z')"
+            echo "### 触发=${{ github.event_name }}  计划='${{ github.event.schedule }}'  正式='${{ steps.d.outputs.root }}'  测试='${{ steps.d.outputs.test }}'  $(date '+%Y-%m-%d %H:%M %Z')"
             echo ""
-            if [ -z "$ROOT" ]; then
-              echo "今天不是记账日，本次为空跑（cron 只负责『叫醒』，跑不跑由脚本判断）。"
-            else
+            for R in paper paper_test; do
               for PF in ${{ env.PORTFOLIOS }}; do
-                if [ -f "$ROOT/n$PF/equity.csv" ]; then
-                  echo "**$ROOT n=$PF**"
+                if [ -f "$R/n$PF/equity.csv" ]; then
+                  echo "**$R n=$PF**"
                   echo '```'
-                  tail -n 5 "$ROOT/n$PF/equity.csv"
+                  tail -n 3 "$R/n$PF/equity.csv"
                   echo '```'
                 fi
               done
+            done
+            if [ -n "$WARN" ]; then
+              echo ""
+              echo "**⚠️ $WARN**"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$WARN" ]; then
+            echo "::warning::$WARN"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: log-${{ github.run_number }}
-          path: ${{ steps.d.outputs.root }}/logs/*.log
+          path: |
+            paper/logs/*.log
+            paper_test/logs/*.log
           retention-days: 30
           if-no-files-found: ignore
