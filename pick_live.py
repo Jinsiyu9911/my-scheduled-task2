@@ -148,6 +148,9 @@ def snapshot_tencent(codes: list[str], batch: int = 60, quiet: bool = True) -> p
                 "mktcap": _f(f[45]) * 1e8,        # 亿元 -> 元
                 "limit_up": _f(f[47]),
                 "limit_down": _f(f[48]),
+                # f[30] 是行情自带的时间戳，形如 20261124161430。
+                # 每日估值靠它拿到「这笔报价属于哪个交易日」，不用再拉 K 线。
+                "quote_time": str(f[30]),
             })
         if not quiet and gi % 5 == 0:
             print(f"    ... 快照 {gi}/{len(groups)} 批", flush=True)

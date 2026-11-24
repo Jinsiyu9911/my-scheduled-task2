@@ -50,7 +50,7 @@ except Exception:                          # noqa: BLE001
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pick_live import select_candidates   # noqa: E402
+from pick_live import select_candidates, snapshot_tencent   # noqa: E402
 
 # --------------------------------------------------------------------------- 费率
 FEES = {
@@ -333,6 +333,152 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
             "ghosts": ghosts}
 
 
+# --------------------------------------------------------------------------- 每日估值
+def mark_portfolio(pf: str, base: Path, date: str, log: list[str],
+                   price: dict[str, float], name: dict[str, str]) -> dict | None:
+    """只按今日报价给持仓估值，追加一行净值 —— 不成交、不改 state。
+
+    这是「每日估值」的核心：策略仍然只在月末调仓，但净值曲线每天都有点，
+    否则一个月只有一个点，中间的回撤完全看不到。
+    """
+    d = base / pf
+    st = load_json(d / "state.json", None)
+    if not st or not st.get("positions"):
+        log.append(f"  [{pf}] 估值跳过：还没有持仓（等月末建仓）")
+        return None
+
+    # 这个交易日已经记过就不要再覆盖：周末重复跑、或月末真调仓刚写过
+    eqp = d / "equity.csv"
+    if eqp.exists():
+        try:
+            old = pd.read_csv(eqp, encoding="utf-8-sig")
+            if (old["date"].astype(str) == str(date)).any():
+                log.append(f"  [{pf}] 估值跳过：{date} 已有记录")
+                return None
+        except Exception:                  # noqa: BLE001
+            pass
+
+    pos = st["positions"]
+    cash = float(st["cash"])
+    mv = 0.0
+    marked: list[tuple[str, float, str]] = []
+    ghosts = []
+    for c in sorted(pos):
+        p = price.get(c)
+        if p is None or not (float(p) > 0):
+            p, src = float(pos[c]["cost"]), "cost"
+            ghosts.append(c)
+        else:
+            p, src = float(p), "market"
+        mv += pos[c]["shares"] * p
+        marked.append((c, p, src))
+    nav = cash + mv
+    nav_prev = prev_nav(eqp, date, float(st.get("initial", INIT_CAPITAL)))
+    ret_pct = round((nav / nav_prev - 1) * 100, 3) if nav_prev else 0.0
+
+    hrows = []
+    for c, p, src in marked:
+        cost = float(pos[c]["cost"])
+        v = pos[c]["shares"] * p
+        hrows.append({
+            "date": date, "portfolio": pf, "code": c,
+            "name": name.get(c, pos[c].get("name", "")),
+            "shares": int(pos[c]["shares"]), "cost_price": cost,
+            "last_price": round(p, 3),
+            "market_value": round(v, 2),
+            "weight": round(v / nav, 4) if nav else 0.0,
+            "pnl_pct": round((p / cost - 1) * 100, 3) if cost else 0.0,
+            "price_src": src,
+        })
+    snapshot_file(d / "holdings.csv", hrows, HOLD_COLS)
+    upsert_block(eqp, [{
+        "date": date, "cash": round(cash, 2), "market_value": round(mv, 2),
+        "nav": round(nav, 2), "nav_index": round(nav / st["initial"], 6),
+        "positions": len(pos), "trades": 0,
+        "ret_pct": ret_pct,
+        "fee_pct": 0.0,
+    }])
+
+    if ghosts:
+        log.append(f"  [{pf}] ! {len(ghosts)} 只无报价，按成本估值："
+                   + "  ".join(f"{c}@{pos[c]['cost']}" for c in ghosts))
+    log.append(f"  [{pf}] NAV {nav:,.2f}（指数 {nav/st['initial']:.4f}） "
+               f"本期 {ret_pct:+.2f}%  持仓 {len(pos)} 只  —— 仅估值，未成交")
+    return {"nav": nav, "nav_index": nav / st["initial"], "positions": len(pos),
+            "ret_pct": ret_pct}
+
+
+# --------------------------------------------------------------------------- 每日估值入口
+def quote_date(snap: pd.DataFrame, head: list[str]) -> str:
+    """从行情自带的时间戳 f[30] 解析出「这笔报价属于哪个交易日」。"""
+    if "quote_time" in snap.columns:
+        vals = [str(x) for x in snap["quote_time"]
+                if str(x).isdigit() and len(str(x)) >= 8]
+        if vals:
+            qt = max(vals)
+            return f"{qt[0:4]}-{qt[4:6]}-{qt[6:8]}"
+    head.append("  [!] 行情没有时间戳，按今天记账")
+    return ""
+
+
+def mark_only_main(base: Path, args, today: dt.date, head: list[str]) -> int:
+    """每日估值：只给已有持仓按今日报价记一行净值。
+
+    为什么要单独一条路径：
+      - 策略只在月末调仓，所以那个入口一个月才放行一次；
+      - 但净值曲线需要每天一个点，否则中间的回撤完全看不见。
+    代价很小：只拉持仓那 5~10 只的报价（1 次请求），不拉全市场、不拉 K 线。
+    """
+    per: dict[str, dict] = {}
+    codes: set[str] = set()
+    for pf_n in args.n:
+        st = load_json(base / f"n{pf_n}" / "state.json", None)
+        if st and st.get("positions"):
+            per[f"n{pf_n}"] = st
+            codes.update(st["positions"])
+
+    if not codes:
+        print(f"[mark] {args.root} 还没有持仓（等月末建仓），跳过当日估值")
+        return 0
+
+    try:
+        snap = snapshot_tencent(sorted(codes), quiet=True)
+    except Exception as exc:               # noqa: BLE001
+        print(f"  [X] 拉报价失败：{exc}")
+        return 2
+    if snap is None or snap.empty:
+        print("  [X] 拉不到报价，跳过当日估值")
+        return 2
+
+    date = args.date or quote_date(snap, head)
+    if not date:
+        date = today.isoformat()
+    try:
+        if dt.date.fromisoformat(date).weekday() >= 5:
+            print(f"[mark] {date} 是周末，跳过当日估值")
+            return 0
+    except ValueError:
+        pass
+
+    price = {str(c): float(p) for c, p in zip(snap["code"], snap["price"])}
+    name = {str(c): str(n) for c, n in zip(snap["code"], snap["name"])}
+
+    head[1] = f"记账日期 {date}"
+    head.append(f"每日估值 | 报价日 {date} | 持仓报价 {len(price)} 只")
+
+    log = list(head)
+    for pf in per:
+        mark_portfolio(pf, base, date, log, price, name)
+
+    (base / "logs").mkdir(parents=True, exist_ok=True)
+    lf = base / "logs" / f"{date}.log"
+    if not lf.exists():
+        # 只有当天没有别的日志时才写；月末真调仓那份日志不能被估值覆盖掉
+        lf.write_text("\n".join(log), encoding="utf-8")
+    print("\n".join(log))
+    return 0
+
+
 # --------------------------------------------------------------------------- 主流程
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -345,6 +491,10 @@ def main() -> int:
                     help="忽略「是否月末最后交易日」和「本月已记账」两道检查")
     ap.add_argument("--skip-if-ran-today", action="store_true",
                     help="今天已经跑过就退出（给每周测试跑用，避免同日重复调仓）")
+    ap.add_argument("--skip-if-recorded", action="store_true",
+                    help="这个交易日已经记过账就退出（避免周末把周五那行的成交清零）")
+    ap.add_argument("--mark-only", action="store_true",
+                    help="只做每日估值：按今日报价给持仓记一行净值，不成交、不改 state")
     ap.add_argument("--window", type=int, default=20)
     ap.add_argument("--cut", type=int, default=2)
     ap.add_argument("--dry-run", action="store_true", help="只选股，不写模拟盘")
@@ -356,6 +506,10 @@ def main() -> int:
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     head = [f"模拟盘运行 {stamp}", f"记账日期 {run_date}"]
     sm = load_json(base / "state.json", {})
+
+    # ── 每日估值：绕过下面所有月份的闸门，只算净值不动仓
+    if args.mark_only:
+        return mark_only_main(base, args, today, head)
 
     # ── 闸门顺序很重要 ────────────────────────────────────────────────
     # 1) 同日复跑保护：每周测试跑 + 手动重跑同一天时不要二次调仓
@@ -428,6 +582,15 @@ def main() -> int:
     # 4) 幂等键必须用**定稿后**的 run_date。以前在 data_date 校正之前就取，
     #    跨月补跑会把 last_month 写成下个月，于是下个月的正式跑被自己的幂等挡死。
     month_key = run_date[:7]
+
+    # 5) 这个交易日已经记过就退出。
+    #    paper_test 每天 --force 跑，周末的 data_date 还是周五，
+    #    不挡的话会把周五那行的 trades 覆盖成 0，成交记录就丢了。
+    if args.skip_if_recorded and not args.date and not args.dry_run:
+        if str(sm.get("data_date") or "") == str(run_date):
+            print(f"[skip] 交易日 {run_date} 已经记过账，跳过（避免覆盖当日成交）")
+            return 0
+
     if sm.get("last_month") == month_key and not args.dry_run and not args.force:
         print(f"[skip] {month_key} 已记账（上次 {sm.get('last_run')}），退出")
         return 0

@@ -223,12 +223,16 @@ def run_paper(root: str, extra: list[str] | None = None) -> int:
 
 
 def main_trigger(why: str) -> bool:
-    """主触发：正式盘（不带 --force，让脚本自己的三道闸门决定）+ 测试盘。"""
+    """主触发：正式盘（不带 --force，让脚本自己的闸门决定）+ 测试盘 + 每日估值。"""
     printf(f"===== 主触发（{why}）=====")
     code_paper = run_paper("paper")
-    code_test = run_paper("paper_test", ["--force", "--skip-if-ran-today"])
-    # 提交交给调用方，和 chain_state 的更新合并成一条 commit，避免一天两条
-    # 选股失败（2）不算做完，留给下一轮 job 重试
+    code_test = run_paper("paper_test",
+                          ["--force", "--skip-if-ran-today", "--skip-if-recorded"])
+    # 每日估值：把今天补进净值曲线（只估值、不成交）。
+    # 必须排在真调仓之后 —— 那天已经有记录了，这两步会自己跳过。
+    run_paper("paper", ["--mark-only"])
+    run_paper("paper_test", ["--mark-only"])
+    # 选股失败（2）不算做完，留给下一轮 job 重试；估值失败不影响这个判断
     return code_paper == 0 and code_test == 0
 
 
