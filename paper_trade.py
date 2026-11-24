@@ -20,8 +20,12 @@
       state.json             幂等：本月是否已记账
       n5/{equity,holdings,trades}.csv  + state.json
       n10/{...}
-      picks/<日期>.csv       当期 20 只候选
-      logs/<日期>.log
+      picks/<YYYY-MM>.csv    按月归档的候选（带 date 列，天内按 rank 升序）
+      logs/<YYYY-MM>.log     按月归档的运行日志（一天一段，最新在上）
+
+    文件数量：一天一个文件的话一年是 245×2 个日志 + 245×2 个 picks ≈ 980 个，
+    5 年近 5000 个，仓库树会被撑爆。按月归档后是 48 个/年。
+    CSV 一律日期降序（新的在上面），同一天内 trades 也是倒序。
 
 用法
 ----
@@ -36,6 +40,7 @@ import argparse
 import calendar
 import datetime as dt
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -152,17 +157,20 @@ def _sorted_desc(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("date", ascending=False, kind="stable").reset_index(drop=True)
 
 
-def upsert_block(p: Path, rows: list[dict]) -> None:
+def upsert_block(p: Path, rows: list[dict], reverse_rows: bool = True) -> None:
     """按日期整块 upsert：同一天重复运行（测试/补跑）时整块覆盖，不产生重复行。
 
     equity / trades 走这里，保证「同一天最多一份记录」。
-    整块在写入前先翻转，于是同一天内也是「后发生的在上面」（trade 日志符合券商习惯）。
+    reverse_rows=True 时整块先翻转再写，于是同一天内也是「后发生的在上面」
+    （trade 日志符合券商习惯）；picks 这种「同一时刻一批行」的场景传 False，
+    保持 rank 升序。
     列不一致时取并集（旧文件缺新列时补空，反之亦然），避免 schema 演进时 KeyError。
     """
     if not rows:
         return                                 # 空块不动文件：同日复跑无成交＝维持原记录
     p.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(list(reversed(rows))).astype(str)
+    block = list(reversed(rows)) if reverse_rows else list(rows)
+    df = pd.DataFrame(block).astype(str)
     if p.exists():
         old = pd.read_csv(p, dtype=str)
         old = old[old["date"] != str(rows[0]["date"])]
@@ -180,6 +188,46 @@ def snapshot_file(p: Path, rows: list[dict], cols: list[str]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows, columns=cols).astype(str) if rows else pd.DataFrame(columns=cols)
     df.to_csv(p, index=False, encoding="utf-8-sig")
+
+
+# --------------------------------------------------------------------------- 日志
+# 一天一个 log 文件的话，一年就是 245×2 个文件、5 年近 5000 个，仓库树会被撑爆。
+# 所以按月归档成 logs/YYYY-MM.log，里面一天一段，最新的那段在最上面。
+LOG_SEP = re.compile(r"^===== (\d{4}-\d{2}-\d{2}) =====$", re.M)
+
+
+def _split_log_blocks(text: str) -> list[tuple[str, str]]:
+    """把日志文件切成 [(日期, 正文)]，保持文件里的顺序。"""
+    out: list[tuple[str, str]] = []
+    marks = list(LOG_SEP.finditer(text))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out.append((m.group(1), text[m.end():end].strip("\n")))
+    return out
+
+
+def write_log(base: Path, date: str, lines: list[str]) -> Path:
+    """把一天的日志写进按月归档的文件；同一天重复写会整块替换（幂等）。
+
+    块按日期降序排（最新在上），所以同一天重跑不会把这一块顶到比它更晚的日期上面。
+    """
+    d = base / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{date[:7]}.log"
+
+    blocks: list[tuple[str, str]] = []
+    if p.exists():
+        try:
+            blocks = [b for b in _split_log_blocks(p.read_text(encoding="utf-8"))
+                      if b[0] != date]
+        except Exception:                  # noqa: BLE001
+            blocks = []
+    blocks.append((date, "\n".join(lines).strip("\n")))
+    blocks.sort(key=lambda b: b[0], reverse=True)      # 日期降序，最新在上
+
+    text = "\n\n".join(f"===== {d_} =====\n{body}" for d_, body in blocks) + "\n"
+    p.write_text(text, encoding="utf-8")
+    return p
 
 
 # --------------------------------------------------------------------------- 单个盘
@@ -473,14 +521,14 @@ def mark_only_main(base: Path, args, today: dt.date, head: list[str]) -> int:
     head.append(f"每日估值 | 报价日 {date} | 持仓报价 {len(price)} 只")
 
     log = list(head)
+    wrote = 0
     for pf in per:
-        mark_portfolio(pf, base, date, log, price, name)
+        if mark_portfolio(pf, base, date, log, price, name):
+            wrote += 1
 
-    (base / "logs").mkdir(parents=True, exist_ok=True)
-    lf = base / "logs" / f"{date}.log"
-    if not lf.exists():
-        # 只有当天没有别的日志时才写；月末真调仓那份日志不能被估值覆盖掉
-        lf.write_text("\n".join(log), encoding="utf-8")
+    # 只有真的记了净值才写日志：否则会在月末那天用「估值跳过」盖掉调仓记录
+    if wrote:
+        write_log(base, date, log)
     print("\n".join(log))
     return 0
 
@@ -626,12 +674,16 @@ def main() -> int:
     fees = {**FEES, **cfg.get("fees", {})}
 
     # --- 落盘候选 ---
-    (base / "picks").mkdir(exist_ok=True)
+    # 同样按月归档：一天一个 CSV 的话一年又是 490 个文件。
+    # picks/YYYY-MM.csv，带 date 列，同一天重跑整块替换，日期降序、天内 rank 升序。
     pk = kept.head(args.cand).copy()
     pk["mktcap_亿"] = (pk["mktcap"] / 1e8).round(2)
     pk["owner"] = pk["code"].map(res["kind"])
-    pk.drop(columns=["mktcap", "is_lu"], errors="ignore").to_csv(
-        base / "picks" / f"{run_date}.csv", index=False, encoding="utf-8-sig")
+    pk = pk.drop(columns=["mktcap", "is_lu", "quote_time"], errors="ignore")
+    pk.insert(0, "date", run_date)
+    (base / "picks").mkdir(exist_ok=True)
+    upsert_block(base / "picks" / f"{run_date[:7]}.csv", pk.to_dict("records"),
+                 reverse_rows=False)
 
     # --- 跑各盘 ---
     log = list(head)
@@ -652,8 +704,7 @@ def main() -> int:
     for pf, v in summary.items():
         log.append(f"  {pf}: NAV {v['nav']:,.2f}  指数 {v['nav_index']:.4f}  "
                    f"持仓 {v['positions']}  本期 {v['ret_pct']:+.2f}%")
-    (base / "logs").mkdir(exist_ok=True)
-    (base / "logs" / f"{run_date}.log").write_text("\n".join(log), encoding="utf-8")
+    write_log(base, run_date, log)
     print("\n".join(log))
     return 0
 
