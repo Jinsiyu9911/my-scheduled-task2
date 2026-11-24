@@ -62,6 +62,10 @@ FEES = {
 INIT_CAPITAL = 200_000.0
 LOT = 100
 
+# holdings.csv 的列（整表覆盖，只留当前持仓）
+HOLD_COLS = ["date", "portfolio", "code", "name", "shares", "cost_price",
+             "last_price", "market_value", "weight", "pnl_pct", "price_src"]
+
 
 def calc_fee(amount: float, side: str, fees: dict) -> tuple[float, float, float, float]:
     """返回 (佣金, 印花税, 过户费, 合计)。"""
@@ -102,16 +106,22 @@ def in_month_end_window(d: dt.date) -> bool:
 
 
 def prev_nav(p: Path, date: str, default: float) -> float:
-    """读 date 之前最后一条净值记录；没有历史时退化为初始资金。"""
+    """读 date 之前最近一条净值记录；没有历史时退化为初始资金。
+
+    注意 CSV 是日期降序（新的在上面），所以不能取「最后一行」。
+    这里先过滤再按日期升序排，取最后一条 —— 对字符串列最稳
+    （Series.idxmax() 对 object dtype 会直接抛 TypeError）。
+    """
     if not p.exists():
         return default
     try:
         df = pd.read_csv(p, encoding="utf-8-sig")
-        df = df[df["date"].astype(str) < str(date)]
+        df["date"] = df["date"].astype(str)
+        df = df[df["date"] < str(date)]
         if len(df):
-            return float(df["nav"].iloc[-1])
-    except Exception:                      # noqa: BLE001
-        pass
+            return float(df.sort_values("date", kind="stable")["nav"].iloc[-1])
+    except Exception as exc:               # noqa: BLE001
+        print(f"  [!] 读取上期净值失败（{type(exc).__name__}），退回初始资金：{exc}")
     return default
 
 
@@ -130,10 +140,17 @@ def save_json(p: Path, obj: dict) -> None:
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _sorted_desc(df: pd.DataFrame) -> pd.DataFrame:
+    """按日期降序（新记录在上面）；同一天内保持原有顺序。"""
+    if "date" not in df.columns or not len(df):
+        return df
+    return df.sort_values("date", ascending=False, kind="stable").reset_index(drop=True)
+
+
 def upsert_block(p: Path, rows: list[dict]) -> None:
     """按日期整块 upsert：同一天重复运行（测试/补跑）时整块覆盖，不产生重复行。
 
-    holdings / equity / trades 三个文件都走这里，保证「同一天最多一份记录」。
+    equity / trades 走这里，保证「同一天最多一份记录」，并按日期降序排列。
     列不一致时取并集（旧文件缺新列时补空，反之亦然），避免 schema 演进时 KeyError。
     """
     if not rows:
@@ -146,6 +163,16 @@ def upsert_block(p: Path, rows: list[dict]) -> None:
         cols = list(dict.fromkeys([*old.columns, *df.columns]))
         df = pd.concat([old.reindex(columns=cols), df.reindex(columns=cols)],
                        ignore_index=True)
+    _sorted_desc(df).to_csv(p, index=False, encoding="utf-8-sig")
+
+
+def snapshot_file(p: Path, rows: list[dict], cols: list[str]) -> None:
+    """整表重写：只留当前快照，不留历史（holdings.csv 用）。
+
+    与 upsert_block 的区别是彻底覆盖，所以文件里永远只有「当前持仓」这几行。
+    """
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(rows, columns=cols).astype(str) if rows else pd.DataFrame(columns=cols)
     df.to_csv(p, index=False, encoding="utf-8-sig")
 
 
@@ -281,7 +308,8 @@ def run_portfolio(pf: str, n: int, kept: pd.DataFrame, date: str,
     if ghosts:
         log.append(f"  [{pf}] ! {len(ghosts)} 只无报价，按成本估值（市值不可信）："
                    + "  ".join(f"{c}@{pos[c]['cost']}" for c in ghosts))
-    upsert_block(d / "holdings.csv", hrows)
+    # holdings.csv 只保留当前持仓快照，不留历史（整表覆盖）
+    snapshot_file(d / "holdings.csv", hrows, HOLD_COLS)
     fee_paid = sum(t["fee_total"] for t in trades)
     ret_pct = round((nav / nav_prev - 1) * 100, 3) if nav_prev else 0.0
     upsert_block(d / "equity.csv", [{

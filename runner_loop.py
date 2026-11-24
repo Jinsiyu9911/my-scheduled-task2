@@ -227,7 +227,7 @@ def main_trigger(why: str) -> bool:
     printf(f"===== 主触发（{why}）=====")
     code_paper = run_paper("paper")
     code_test = run_paper("paper_test", ["--force", "--skip-if-ran-today"])
-    commit_data()
+    # 提交交给调用方，和 chain_state 的更新合并成一条 commit，避免一天两条
     # 选股失败（2）不算做完，留给下一轮 job 重试
     return code_paper == 0 and code_test == 0
 
@@ -236,7 +236,6 @@ def preopen_trigger(why: str) -> bool:
     """盘前补跑：只补正式盘。必须赶在 09:30 开盘前跑完。"""
     printf(f"===== 盘前补跑（{why}）=====")
     code = run_paper("paper")
-    commit_data()
     return code == 0
 
 
@@ -263,10 +262,11 @@ def main() -> int:
 
     if args.run_now:
         printf("[--run-now] 立刻执行一次主触发")
-        if main_trigger("手动 run-now"):
+        ok = main_trigger("手动 run-now")
+        if ok:
             st["last_main"] = now().date().isoformat()
             save_state(st)
-            commit_data(verbose=False)
+        commit_data()
 
     while True:
         cur = now()
@@ -276,30 +276,34 @@ def main() -> int:
         # ---- 1) 主触发：到点且今天还没跑过（故意用 >=，到点后的任何时刻都能补跑）
         if hhmm >= MAIN_AT and st.get("last_main") != today:
             printf(f"到达主触发时刻（{hhmm} >= {MAIN_AT}），今天 {today} 还没跑")
-            if main_trigger(f"{hhmm} 主触发"):
+            ok = main_trigger(f"{hhmm} 主触发")
+            if ok:
                 st["last_main"] = today
                 save_state(st)
-                commit_data(verbose=False)
             else:
                 printf("[!] 主触发未成功，不记 last_main，下一轮 job 会重试")
+            # 数据和 chain_state 合并成一条 commit
+            commit_data()
 
         # ---- 2) 盘前补跑：次月 1~3 号的 09:00~09:29
         elif (PREOPEN_FROM <= hhmm < PREOPEN_TO
               and cur.day <= PREOPEN_MAX_DAY
               and st.get("last_preopen") != today):
             printf(f"到达盘前补跑窗口（{hhmm}，每月 {cur.day} 号）")
-            if preopen_trigger(f"{hhmm} 盘前"):
+            ok = preopen_trigger(f"{hhmm} 盘前")
+            if ok:
                 st["last_preopen"] = today
                 save_state(st)
-                commit_data(verbose=False)
             else:
                 printf("[!] 盘前补跑未成功，不记 last_preopen，稍后同窗口内还会再试")
+            commit_data()
 
         # ---- 3) 到点交棒：主动 exit(0)，让 workflow 去 dispatch 下一轮
         elapsed = time.time() - t0
         if elapsed > args.max_run:
             printf(f"已运行 {elapsed:.0f}s，主动退出交棒")
-            save_state(st)
+            # 这里刻意不写 chain_state：没有任何状态变化就不该产生提交，
+            # 否则每 5h45m 都会多一条只有时间戳的噪音 commit。
             commit_data()
             return 0
 

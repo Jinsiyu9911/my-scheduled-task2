@@ -263,7 +263,12 @@ def closes_of(code: str, lmt: int = 30) -> pd.Series | None:
 
 # --------------------------------------------------------------------------- 判定
 def count_limit_up(closes: pd.Series, window: int = 20) -> tuple[int, int]:
-    """(涨停次数, 窗口内可用交易日数)。主板 10% / ST 5%，按收盘价精确判定。"""
+    """(涨停次数, 窗口内可用交易日数)。
+
+    主板 ST 新规下涨跌停幅度同样是 10%，所以统一按「收盘价 ≈ 昨收 ×1.10」判定，
+    不再单独判 5%（旧口径会把 +5% 的 ST 误算成涨停，而本策略持仓几乎全是 ST，
+    那会系统性地多剔股票）。
+    """
     if closes is None or len(closes) < 2:
         return 0, 0
     v = closes.values
@@ -274,8 +279,8 @@ def count_limit_up(closes: pd.Series, window: int = 20) -> tuple[int, int]:
         pc = v[i - 1]
         if pc <= 0:
             continue
-        p10, p05 = round(pc * 1.10 + 1e-9, 2), round(pc * 1.05 + 1e-9, 2)
-        if abs(v[i] - p10) < 0.006 or abs(v[i] - p05) < 0.006:
+        p10 = round(pc * 1.10 + 1e-9, 2)
+        if abs(v[i] - p10) < 0.006:
             n += 1
     return n, used
 
@@ -327,15 +332,8 @@ def select_candidates(cand: int = 80, window: int = 20, cut: int = 2,
     n_delisted = n_valid - len(snap)
 
     snap = snap.copy()
-    # 腾讯给的涨停/跌停价对 ST 一律按 10% 报，但主板 ST 的真实限幅是 5%。
-    # 本策略的持仓几乎全是 ST，不修正会有两个后果：
-    #   1) ST 封在 +5%（真实买不到）不会被 is_lu 判掉，被当成可买；
-    #   2) picks.csv 的「挂涨停价买入」挂到 +10%，ST 到 +5% 就封死，永远不成交。
-    # 判定口径与 count_limit_up() 的 5%/10% 双判保持一致。
-    is_st = name_s[~dead].str.contains("ST")
-    if is_st.any():
-        snap.loc[is_st, "limit_up"] = (snap.loc[is_st, "prev_close"] * 1.05 + 1e-9).round(2)
-        snap.loc[is_st, "limit_down"] = (snap.loc[is_st, "prev_close"] * 0.95 + 1e-9).round(2)
+    # 涨跌停幅度：主板 ST 新规下也是 10%，与普通主板一致，所以直接用行情源给的
+    # limit_up / limit_down 即可，不再按 ST 做 5% 修正。
     snap["is_lu"] = (snap["price"] - snap["limit_up"]).abs() < 0.006
     # 保留含涨停股在内的全量快照：模拟盘需要用它给「不在候选名单里的持仓」定价
     snap_all = snap.copy()
@@ -414,7 +412,7 @@ def main() -> int:
     print(f"  快照有效：{st['n_valid']} 只（原始 {st['n_all']}）")
     print(f"  剔除退市/退市整理期/无报价：{st['n_delisted']} 只"
           f"（其中 {st['n_nolimit']} 只拿不到涨停价，多为停牌）")
-    print(f"  剔除当日涨停：{st['n_limitup']} 只（买不到；ST 按 5% 判定，不是行情源的 10%）")
+    print(f"  剔除当日涨停：{st['n_limitup']} 只（买不到；ST 新规后同样按 10% 判定）")
     print(f"  按总市值升序取前 {len(kept) + len(dropped)} 只算涨停次数")
     print(f"  剔除近{args.window}日涨停 >= {args.cut} 次：{st['n_dropped_rule']} 只")
     if st["n_dropped_rule"]:
@@ -487,7 +485,7 @@ def main() -> int:
     print("  下单规则")
     print("=" * 100)
     print("    买入：挂涨停价（见上表「买入限价」）")
-    print("    卖出：挂跌停价 = round(昨收 x 0.90, 2)，ST 股 = round(昨收 x 0.95, 2)")
+    print("    卖出：挂跌停价 = round(昨收 x 0.90, 2)（ST 新规后同为 10%）")
     print("    买不到：次日再挂，最多 3~5 天；仍买不到 -> 留现金，不做替代")
 
     OUT_DIR.mkdir(exist_ok=True)
