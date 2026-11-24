@@ -221,9 +221,10 @@ jobs:
               for PF in ${{ env.PORTFOLIOS }}; do
                 if [ -f "$R/n$PF/equity.csv" ]; then
                   echo ""
-                  echo "**$R n=$PF**"
+                  echo "**$R n=$PF**（最新在上面）"
                   echo '```'
-                  tail -n 3 "$R/n$PF/equity.csv"
+                  # CSV 是日期降序，所以取头部：表头 + 最近 3 天
+                  head -n 4 "$R/n$PF/equity.csv"
                   echo '```'
                 fi
               done

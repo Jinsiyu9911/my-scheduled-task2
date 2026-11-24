@@ -141,7 +141,12 @@ def save_json(p: Path, obj: dict) -> None:
 
 
 def _sorted_desc(df: pd.DataFrame) -> pd.DataFrame:
-    """按日期降序（新记录在上面）；同一天内保持原有顺序。"""
+    """按日期降序；同一天内也倒序（后发生的在上面）。
+
+    同一块内用 reversed() 先翻一次，再用 kind="stable" 排序 —— 这样：
+      - 同一天里最后执行的那笔排最上面；
+      - 其他日期的行保持文件里原有的顺序，不会被反复重写翻来翻去。
+    """
     if "date" not in df.columns or not len(df):
         return df
     return df.sort_values("date", ascending=False, kind="stable").reset_index(drop=True)
@@ -150,13 +155,14 @@ def _sorted_desc(df: pd.DataFrame) -> pd.DataFrame:
 def upsert_block(p: Path, rows: list[dict]) -> None:
     """按日期整块 upsert：同一天重复运行（测试/补跑）时整块覆盖，不产生重复行。
 
-    equity / trades 走这里，保证「同一天最多一份记录」，并按日期降序排列。
+    equity / trades 走这里，保证「同一天最多一份记录」。
+    整块在写入前先翻转，于是同一天内也是「后发生的在上面」（trade 日志符合券商习惯）。
     列不一致时取并集（旧文件缺新列时补空，反之亦然），避免 schema 演进时 KeyError。
     """
     if not rows:
         return                                 # 空块不动文件：同日复跑无成交＝维持原记录
     p.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(rows).astype(str)
+    df = pd.DataFrame(list(reversed(rows))).astype(str)
     if p.exists():
         old = pd.read_csv(p, dtype=str)
         old = old[old["date"] != str(rows[0]["date"])]
