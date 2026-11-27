@@ -73,11 +73,17 @@ HOLD_COLS = ["date", "portfolio", "code", "name", "shares", "cost_price",
 
 
 def calc_fee(amount: float, side: str, fees: dict) -> tuple[float, float, float, float]:
-    """返回 (佣金, 印花税, 过户费, 合计)。"""
+    """返回 (佣金, 印花税, 过户费, 合计)。
+
+    合计是「三个已舍入分量之和」，不是「未舍入之和再舍入」——
+    否则 CSV 里会出现 10.14 + 20.27 + 0.41 = 30.82 但 fee_total 写 30.81 的情况，
+    账目对不上。
+    """
     comm = max(amount * fees["commission_rate"], fees["min_commission"])
     stamp = amount * fees["stamp_duty_rate"] if side == "SELL" else 0.0
     tran = amount * fees["transfer_fee_rate"]
-    return round(comm, 2), round(stamp, 2), round(tran, 2), round(comm + stamp + tran, 2)
+    c, s, t = round(comm, 2), round(stamp, 2), round(tran, 2)
+    return c, s, t, round(c + s + t, 2)
 
 
 # --------------------------------------------------------------------------- 日期
